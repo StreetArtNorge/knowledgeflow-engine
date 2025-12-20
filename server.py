@@ -83,7 +83,7 @@ class ProfileSyncRequest(BaseModel):
     platform: str  # "tiktok", "youtube", "instagram"
     user_id: str
     source_id: str
-    max_videos: int = 10
+    max_videos: int = 200
 
 class WebhookPayload(BaseModel):
     event: str
