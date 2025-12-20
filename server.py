@@ -6,7 +6,7 @@ Deploy this to Render, Railway, or any VPS with Python support.
 This server handles:
 1. Video downloading via yt-dlp (TikTok, YouTube, Instagram)
 2. Audio transcription via Google Gemini
-3. Knowledge extraction via Gemini 1.5 Pro
+3. Knowledge extraction via Gemini
 4. Pushing results back to your v0 app via webhooks
 
 ENVIRONMENT VARIABLES REQUIRED:
@@ -46,10 +46,13 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "your-webhook-secret-here")
 V0_WEBHOOK_URL = os.getenv("V0_WEBHOOK_URL", "")
 
 # Initialize Google AI
-genai.configure(api_key=GOOGLE_API_KEY)
+if GOOGLE_API_KEY:
+    genai.configure(api_key=GOOGLE_API_KEY)
 
 # Initialize Supabase
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+supabase: Client = None
+if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 # FastAPI app
 app = FastAPI(
@@ -61,7 +64,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -80,15 +83,10 @@ class VideoProcessRequest(BaseModel):
 
 class ProfileSyncRequest(BaseModel):
     username: str
-    platform: str  # "tiktok", "youtube", "instagram"
+    platform: str
     user_id: str
     source_id: str
-    max_videos: int = 2000
-
-class WebhookPayload(BaseModel):
-    event: str
-    data: dict
-    timestamp: str
+    max_videos: int = 50
 
 class HealthResponse(BaseModel):
     status: str
@@ -118,7 +116,7 @@ async def send_webhook(event: str, data: dict):
         "data": data,
         "timestamp": datetime.utcnow().isoformat()
     }
-    payload_str = json.dumps(payload)
+    payload_str = json.dumps(payload, separators=(',', ':'), sort_keys=True)
     signature = generate_webhook_signature(payload_str)
     
     async with httpx.AsyncClient() as client:
@@ -133,18 +131,17 @@ async def send_webhook(event: str, data: dict):
                 timeout=30.0
             )
             print(f"Webhook sent: {event} - Status: {response.status_code}")
+            if response.status_code != 200:
+                print(f"Webhook response: {response.text}")
         except Exception as e:
             print(f"Webhook failed: {e}")
 
 def update_queue_status(queue_id: str, status: str, result: dict = None, error: str = None):
     """Update processing queue status in Supabase"""
-    if not queue_id:
+    if not queue_id or not supabase:
         return
     
-    update_data = {
-        "status": status,
-        "updated_at": datetime.utcnow().isoformat()
-    }
+    update_data = {"status": status}
     
     if status == "processing":
         update_data["started_at"] = datetime.utcnow().isoformat()
@@ -155,12 +152,6 @@ def update_queue_status(queue_id: str, status: str, result: dict = None, error: 
         update_data["result"] = result
     if error:
         update_data["error_message"] = error
-        try:
-            current = supabase.table("processing_queue").select("attempts").eq("id", queue_id).execute()
-            if current.data:
-                update_data["attempts"] = current.data[0]["attempts"] + 1
-        except:
-            pass
     
     try:
         supabase.table("processing_queue").update(update_data).eq("id", queue_id).execute()
@@ -172,10 +163,7 @@ def update_queue_status(queue_id: str, status: str, result: dict = None, error: 
 # ============================================================================
 
 def download_video(video_url: str) -> tuple[str, dict]:
-    """
-    Download video audio using yt-dlp
-    Returns: (file_path, metadata)
-    """
+    """Download video audio using yt-dlp"""
     os.makedirs("downloads", exist_ok=True)
     
     ydl_opts = {
@@ -197,7 +185,6 @@ def download_video(video_url: str) -> tuple[str, dict]:
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=True)
-            
             video_id = info.get('id', 'unknown')
             file_path = f"downloads/{video_id}.mp3"
             
@@ -214,9 +201,7 @@ def download_video(video_url: str) -> tuple[str, dict]:
                 'platform': detect_platform(video_url),
                 'original_url': video_url
             }
-            
             return file_path, metadata
-            
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
 
@@ -232,17 +217,11 @@ def detect_platform(url: str) -> str:
     return 'unknown'
 
 def transcribe_audio(file_path: str) -> dict:
-    """
-    Transcribe audio using Google Gemini 1.5 Pro
-    Gemini can process audio directly!
-    Returns: {text, segments with timestamps}
-    """
+    """Transcribe audio using Google Gemini"""
     try:
-        # Upload the audio file to Gemini
         audio_file = genai.upload_file(file_path, mime_type="audio/mp3")
         
-        # Use Gemini 1.5 Pro which has native audio understanding
-        model = genai.GenerativeModel('gemini-1.5-pro')
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
         prompt = """Listen to this audio and provide a complete transcription.
         
@@ -257,9 +236,7 @@ Return your response as JSON with this exact format:
     "duration": 60
 }
 
-Break the transcription into logical segments of roughly 10-30 seconds each.
-Estimate the timestamps based on speech patterns and pauses.
-Be accurate with the transcription - capture every word spoken."""
+Break the transcription into logical segments of roughly 10-30 seconds each."""
 
         response = model.generate_content(
             [audio_file, prompt],
@@ -269,10 +246,7 @@ Be accurate with the transcription - capture every word spoken."""
             )
         )
         
-        # Parse the JSON response
         result = json.loads(response.text)
-        
-        # Clean up the uploaded file
         audio_file.delete()
         
         return {
@@ -281,22 +255,22 @@ Be accurate with the transcription - capture every word spoken."""
             'language': result.get('language', 'en'),
             'duration': result.get('duration', 0)
         }
-        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+        print(f"Transcription error: {e}")
+        # Return empty transcript on failure instead of crashing
+        return {'text': '', 'segments': [], 'language': 'en', 'duration': 0}
 
-def extract_knowledge_atoms(transcript: str, video_metadata: dict) -> list[dict]:
-    """
-    Extract knowledge atoms from transcript using Gemini 1.5 Pro
-    Returns: list of knowledge atoms
-    """
+def extract_knowledge_atoms(transcript: str, video_metadata: dict) -> tuple:
+    """Extract knowledge atoms from transcript using Gemini"""
+    if not transcript:
+        return [], "", []
+    
     extraction_prompt = f"""Analyze this video transcript and extract distinct "Knowledge Atoms" - discrete, learnable pieces of information.
 
 VIDEO TITLE: {video_metadata.get('title', 'Unknown')}
-VIDEO DESCRIPTION: {video_metadata.get('description', '')[:500]}
 
 TRANSCRIPT:
-{transcript[:12000]}
+{transcript[:8000]}
 
 For each knowledge atom, provide:
 1. type: One of ["concept", "technique", "principle", "fact", "quote", "action_item"]
@@ -324,10 +298,10 @@ Return JSON format:
     "main_topics": ["topic1", "topic2", "topic3"]
 }}
 
-Extract 3-8 knowledge atoms depending on content density. Focus on actionable, memorable insights."""
+Extract 3-8 knowledge atoms depending on content density."""
 
     try:
-        model = genai.GenerativeModel('gemini-1.5-pro')
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
         response = model.generate_content(
             extraction_prompt,
@@ -340,46 +314,9 @@ Extract 3-8 knowledge atoms depending on content density. Focus on actionable, m
         
         result = json.loads(response.text)
         return result.get('atoms', []), result.get('video_summary', ''), result.get('main_topics', [])
-        
     except Exception as e:
         print(f"Knowledge extraction failed: {e}")
         return [], "", []
-
-def generate_quiz_questions(atom: dict) -> list[dict]:
-    """Generate quiz questions for a knowledge atom using Gemini"""
-    quiz_prompt = f"""Create 2 multiple-choice quiz questions to test understanding of this knowledge:
-
-TITLE: {atom.get('title')}
-CONTENT: {atom.get('content')}
-
-Return JSON format:
-{{
-    "questions": [
-        {{
-            "question": "The question text?",
-            "options": ["Option A", "Option B", "Option C", "Option D"],
-            "correct_index": 0,
-            "explanation": "Why this is correct..."
-        }}
-    ]
-}}"""
-
-    try:
-        model = genai.GenerativeModel('gemini-1.5-flash')  # Use Flash for speed on simple tasks
-        
-        response = model.generate_content(
-            quiz_prompt,
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                temperature=0.5,
-                max_output_tokens=1000
-            )
-        )
-        
-        result = json.loads(response.text)
-        return result.get('questions', [])
-    except:
-        return []
 
 # ============================================================================
 # BACKGROUND PROCESSING
@@ -396,33 +333,15 @@ async def process_video_task(
     video_db_id = None
     
     try:
-        # Update status: downloading
         update_queue_status(queue_id, "processing")
-        await send_webhook("processing_started", {
-            "queue_id": queue_id,
-            "video_url": video_url,
-            "stage": "downloading"
-        })
         
         # 1. Download video
         print(f"Downloading: {video_url}")
         file_path, metadata = download_video(video_url)
         
-        await send_webhook("processing_progress", {
-            "queue_id": queue_id,
-            "stage": "transcribing",
-            "progress": 25
-        })
-        
         # 2. Transcribe audio
         print(f"Transcribing: {file_path}")
         transcript_data = transcribe_audio(file_path)
-        
-        await send_webhook("processing_progress", {
-            "queue_id": queue_id,
-            "stage": "extracting",
-            "progress": 50
-        })
         
         # 3. Save video to database
         video_data = {
@@ -432,18 +351,17 @@ async def process_video_task(
             "video_id": metadata['video_id'],
             "video_url": video_url,
             "title": metadata['title'],
-            "description": metadata['description'][:1000] if metadata['description'] else None,
+            "description": metadata.get('description', '')[:1000] if metadata.get('description') else None,
             "thumbnail_url": metadata['thumbnail'],
             "duration_seconds": metadata['duration'],
-            "view_count": metadata['view_count'],
-            "like_count": metadata['like_count'],
+            "view_count": metadata.get('view_count', 0),
+            "like_count": metadata.get('like_count', 0),
             "transcript_raw": transcript_data['text'],
             "transcript_formatted": json.dumps(transcript_data['segments']),
             "language": transcript_data.get('language', 'en'),
             "processing_status": "extracting"
         }
         
-        # Insert or update video
         try:
             video_result = supabase.table("videos").upsert(
                 video_data,
@@ -451,12 +369,10 @@ async def process_video_task(
             ).execute()
             video_db_id = video_result.data[0]['id']
         except Exception as e:
-            existing = supabase.table("videos").select("id").eq("user_id", user_id).eq("video_id", metadata['video_id']).execute()
-            if existing.data:
-                video_db_id = existing.data[0]['id']
-                supabase.table("videos").update(video_data).eq("id", video_db_id).execute()
-            else:
-                raise e
+            print(f"Video insert error: {e}")
+            # Try insert without upsert
+            video_result = supabase.table("videos").insert(video_data).execute()
+            video_db_id = video_result.data[0]['id']
         
         # 4. Extract knowledge atoms
         print(f"Extracting knowledge from: {metadata['title']}")
@@ -464,12 +380,6 @@ async def process_video_task(
             transcript_data['text'],
             metadata
         )
-        
-        await send_webhook("processing_progress", {
-            "queue_id": queue_id,
-            "stage": "saving",
-            "progress": 75
-        })
         
         # 5. Save atoms to database
         saved_atoms = []
@@ -498,9 +408,12 @@ async def process_video_task(
                 "times_reviewed": 0
             }
             
-            result = supabase.table("knowledge_atoms").insert(atom_data).execute()
-            if result.data:
-                saved_atoms.append(result.data[0])
+            try:
+                result = supabase.table("knowledge_atoms").insert(atom_data).execute()
+                if result.data:
+                    saved_atoms.append(result.data[0])
+            except Exception as e:
+                print(f"Atom insert error: {e}")
         
         # 6. Update video status to completed
         supabase.table("videos").update({
@@ -509,13 +422,10 @@ async def process_video_task(
         }).eq("id", video_db_id).execute()
         
         # 7. Update queue status
-        result_data = {
+        update_queue_status(queue_id, "completed", result={
             "video_id": video_db_id,
-            "atoms_created": len(saved_atoms),
-            "video_summary": video_summary,
-            "main_topics": main_topics
-        }
-        update_queue_status(queue_id, "completed", result=result_data)
+            "atoms_created": len(saved_atoms)
+        })
         
         # 8. Send completion webhook
         await send_webhook("processing_completed", {
@@ -524,21 +434,23 @@ async def process_video_task(
             "video_url": video_url,
             "title": metadata['title'],
             "atoms_created": len(saved_atoms),
-            "video_summary": video_summary,
             "user_id": user_id
         })
         
-        print(f"Successfully processed: {metadata['title']} - {len(saved_atoms)} atoms created")
+        print(f"SUCCESS: {metadata['title']} - {len(saved_atoms)} atoms created")
         
     except Exception as e:
         error_msg = str(e)
-        print(f"Processing failed: {error_msg}")
+        print(f"FAILED: {error_msg}")
         
         if video_db_id:
-            supabase.table("videos").update({
-                "processing_status": "failed",
-                "processing_error": error_msg
-            }).eq("id", video_db_id).execute()
+            try:
+                supabase.table("videos").update({
+                    "processing_status": "failed",
+                    "processing_error": error_msg
+                }).eq("id", video_db_id).execute()
+            except:
+                pass
         
         update_queue_status(queue_id, "failed", error=error_msg)
         
@@ -552,7 +464,6 @@ async def process_video_task(
     finally:
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
-            print(f"Cleaned up: {file_path}")
 
 # ============================================================================
 # API ENDPOINTS
@@ -566,36 +477,29 @@ async def health_check():
         "version": "1.0.0",
         "services": {
             "google_ai": bool(GOOGLE_API_KEY),
-            "supabase": bool(SUPABASE_URL and SUPABASE_SERVICE_KEY),
+            "supabase": bool(supabase),
             "webhook": bool(V0_WEBHOOK_URL)
         }
     }
 
 @app.get("/health")
 async def health():
-    """Simple health endpoint for uptime monitoring"""
-    return {"status": "ok"}
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
 @app.post("/process")
 async def process_video(request: VideoProcessRequest, background_tasks: BackgroundTasks):
-    """
-    Queue a video for processing
-    This immediately returns and processes in the background
-    """
+    """Queue a video for processing"""
     if not request.video_url:
         raise HTTPException(status_code=400, detail="video_url is required")
     
     queue_id = request.queue_id
-    if not queue_id:
+    if not queue_id and supabase:
         queue_entry = supabase.table("processing_queue").insert({
             "user_id": request.user_id,
-            "job_type": "download_video",
+            "job_type": "process_video",
             "status": "pending",
             "priority": request.priority,
-            "payload": {
-                "video_url": request.video_url,
-                "source_id": request.source_id
-            }
+            "payload": {"video_url": request.video_url, "source_id": request.source_id}
         }).execute()
         queue_id = queue_entry.data[0]['id']
     
@@ -610,30 +514,33 @@ async def process_video(request: VideoProcessRequest, background_tasks: Backgrou
     return {
         "status": "queued",
         "queue_id": queue_id,
-        "message": "Video processing started"
+        "message": "Video queued for processing"
     }
 
 @app.post("/sync-profile")
 async def sync_profile(request: ProfileSyncRequest, background_tasks: BackgroundTasks):
-    """
-    Sync videos from a social media profile
-    """
-    platform_urls = {
-        "tiktok": f"https://www.tiktok.com/@{request.username}",
-        "youtube": f"https://www.youtube.com/@{request.username}/videos",
-        "instagram": f"https://www.instagram.com/{request.username}/"
-    }
+    """Sync videos from a social media profile"""
+    print(f"Syncing profile: @{request.username} on {request.platform}")
     
-    profile_url = platform_urls.get(request.platform)
-    if not profile_url:
+    # Build profile URL
+    if request.platform == "tiktok":
+        profile_url = f"https://www.tiktok.com/@{request.username}"
+    elif request.platform == "youtube":
+        profile_url = f"https://www.youtube.com/@{request.username}/videos"
+    elif request.platform == "instagram":
+        profile_url = f"https://www.instagram.com/{request.username}"
+    else:
         raise HTTPException(status_code=400, detail=f"Unsupported platform: {request.platform}")
     
-    # Fetch video list from profile
+    # Get video URLs using yt-dlp
     ydl_opts = {
-        'extract_flat': True,
         'quiet': True,
         'no_warnings': True,
+        'extract_flat': True,
         'playlistend': request.max_videos,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
     }
     
     try:
@@ -641,72 +548,76 @@ async def sync_profile(request: ProfileSyncRequest, background_tasks: Background
             info = ydl.extract_info(profile_url, download=False)
             
             videos = []
-            entries = info.get('entries', [])[:request.max_videos]
+            if 'entries' in info:
+                for entry in info['entries'][:request.max_videos]:
+                    if entry and entry.get('url'):
+                        videos.append({
+                            'url': entry.get('url') or entry.get('webpage_url'),
+                            'id': entry.get('id'),
+                            'title': entry.get('title', 'Unknown')
+                        })
             
-            for entry in entries:
-                video_url = entry.get('url') or entry.get('webpage_url')
-                if video_url:
-                    videos.append({
-                        "url": video_url,
-                        "title": entry.get('title', 'Unknown'),
-                        "id": entry.get('id')
-                    })
+            print(f"Found {len(videos)} videos for @{request.username}")
             
             # Queue each video for processing
-            queued = []
+            queued = 0
             for video in videos:
-                queue_entry = supabase.table("processing_queue").insert({
-                    "user_id": request.user_id,
-                    "job_type": "download_video",
-                    "status": "pending",
-                    "priority": 5,
-                    "payload": {
-                        "video_url": video['url'],
-                        "source_id": request.source_id
-                    }
-                }).execute()
+                if not video.get('url'):
+                    continue
+                    
+                video_url = video['url']
+                if not video_url.startswith('http'):
+                    if request.platform == "tiktok":
+                        video_url = f"https://www.tiktok.com/@{request.username}/video/{video['id']}"
+                    else:
+                        video_url = f"https://www.youtube.com/watch?v={video['id']}"
                 
-                background_tasks.add_task(
-                    process_video_task,
-                    video['url'],
-                    request.user_id,
-                    request.source_id,
-                    queue_entry.data[0]['id']
-                )
-                
-                queued.append({
-                    "queue_id": queue_entry.data[0]['id'],
-                    "video_url": video['url'],
-                    "title": video['title']
-                })
+                # Create queue entry
+                if supabase:
+                    try:
+                        queue_entry = supabase.table("processing_queue").insert({
+                            "user_id": request.user_id,
+                            "job_type": "process_video",
+                            "status": "pending",
+                            "priority": 5,
+                            "payload": {
+                                "video_url": video_url,
+                                "source_id": request.source_id,
+                                "video_title": video.get('title')
+                            }
+                        }).execute()
+                        
+                        # Queue the processing task
+                        background_tasks.add_task(
+                            process_video_task,
+                            video_url,
+                            request.user_id,
+                            request.source_id,
+                            queue_entry.data[0]['id']
+                        )
+                        queued += 1
+                    except Exception as e:
+                        print(f"Failed to queue video: {e}")
+            
+            # Update source last_synced
+            if supabase:
+                try:
+                    supabase.table("sources").update({
+                        "last_synced_at": datetime.utcnow().isoformat()
+                    }).eq("id", request.source_id).execute()
+                except Exception as e:
+                    print(f"Failed to update source: {e}")
             
             return {
-                "status": "syncing",
+                "status": "success",
                 "videos_found": len(videos),
-                "videos_queued": len(queued),
-                "queued": queued
+                "videos_queued": queued,
+                "message": f"Found {len(videos)} videos, queued {queued} for processing"
             }
             
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Profile sync failed: {str(e)}")
-
-@app.post("/webhook/test")
-async def test_webhook():
-    """Test the webhook connection"""
-    await send_webhook("test", {
-        "message": "Webhook connection successful",
-        "timestamp": datetime.utcnow().isoformat()
-    })
-    return {"status": "sent", "url": V0_WEBHOOK_URL}
-
-# ============================================================================
-# MAIN
-# ============================================================================
+        print(f"Sync failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Sync failed: {str(e)}")
 
 if __name__ == "__main__":
-    print("Starting KnowledgeFlow Processing Engine (Google AI)...")
-    print(f"Google AI configured: {bool(GOOGLE_API_KEY)}")
-    print(f"Supabase configured: {bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)}")
-    print(f"Webhook URL: {V0_WEBHOOK_URL or 'Not configured'}")
-    
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
