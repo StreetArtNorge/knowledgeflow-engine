@@ -23,7 +23,7 @@ import asyncio
 import hashlib
 import hmac
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 import uvicorn
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -55,7 +55,7 @@ if SUPABASE_URL and SUPABASE_SERVICE_KEY:
 app = FastAPI(
     title="KnowledgeFlow Processing Engine",
     description="Video processing, transcription, and knowledge extraction API",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 app.add_middleware(
@@ -79,6 +79,25 @@ class ProfileSyncRequest(BaseModel):
     user_id: str
     source_id: str
     max_videos: int = 50
+
+class ListVideosRequest(BaseModel):
+    username: str
+    platform: str
+    max_videos: int = 100
+
+class VideoInfo(BaseModel):
+    url: str
+    title: str
+    description: str = ""
+    thumbnail: str = ""
+    duration: int = 0
+    view_count: int = 0
+    like_count: int = 0
+
+class ProcessSelectedRequest(BaseModel):
+    videos: List[VideoInfo]
+    source_id: str
+    user_id: str
 
 # Utility Functions
 def generate_webhook_signature(payload: str) -> str:
@@ -236,7 +255,7 @@ Extract 3-6 knowledge atoms."""
         print(f"Extraction error: {e}")
         return [], "", []
 
-def process_single_video(video_url: str, user_id: str, source_id: str, queue_id: str = None) -> dict:
+def process_single_video(video_url: str, user_id: str, source_id: str, queue_id: str = None, metadata_override: dict = None) -> dict:
     """Process a single video synchronously - download, transcribe, extract, save"""
     file_path = None
     video_db_id = None
@@ -247,6 +266,16 @@ def process_single_video(video_url: str, user_id: str, source_id: str, queue_id:
         
         # 1. Download
         file_path, metadata = download_video(video_url)
+        
+        # Override metadata if provided (from list-videos)
+        if metadata_override:
+            metadata['title'] = metadata_override.get('title') or metadata['title']
+            metadata['description'] = metadata_override.get('description') or metadata['description']
+            metadata['thumbnail'] = metadata_override.get('thumbnail') or metadata['thumbnail']
+            metadata['duration'] = metadata_override.get('duration') or metadata['duration']
+            metadata['view_count'] = metadata_override.get('view_count') or metadata['view_count']
+            metadata['like_count'] = metadata_override.get('like_count') or metadata['like_count']
+        
         print(f"Downloaded: {metadata['title']}")
         
         # 2. Transcribe
@@ -261,7 +290,7 @@ def process_single_video(video_url: str, user_id: str, source_id: str, queue_id:
             "video_id": metadata['video_id'],
             "video_url": video_url,
             "title": metadata['title'],
-            "description": (metadata.get('description') or '')[:500],
+            "description": (metadata.get('description') or '')[:2000],  # Allow longer descriptions
             "thumbnail_url": metadata['thumbnail'],
             "duration_seconds": metadata['duration'],
             "view_count": metadata.get('view_count', 0),
@@ -347,7 +376,7 @@ def process_single_video(video_url: str, user_id: str, source_id: str, queue_id:
 async def root():
     return {
         "status": "healthy",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "services": {
             "google_ai": bool(GOOGLE_API_KEY),
             "supabase": bool(supabase),
@@ -358,6 +387,123 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+@app.post("/list-videos")
+async def list_videos(request: ListVideosRequest):
+    """List all videos from a profile without downloading - returns metadata only"""
+    print(f"Listing videos for @{request.username} on {request.platform}")
+    
+    # Build profile URL
+    if request.platform == "tiktok":
+        profile_url = f"https://www.tiktok.com/@{request.username}"
+    elif request.platform == "youtube":
+        profile_url = f"https://www.youtube.com/@{request.username}/videos"
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported platform: {request.platform}")
+    
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': 'in_playlist',
+        'playlistend': request.max_videos,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(profile_url, download=False)
+            
+            videos = []
+            if 'entries' in info:
+                for entry in info['entries']:
+                    if entry:
+                        video_id = entry.get('id', '')
+                        
+                        # Build video URL
+                        if request.platform == "tiktok":
+                            video_url = f"https://www.tiktok.com/@{request.username}/video/{video_id}"
+                        else:
+                            video_url = entry.get('url') or f"https://www.youtube.com/watch?v={video_id}"
+                        
+                        videos.append({
+                            'id': video_id,
+                            'url': video_url,
+                            'title': entry.get('title', 'Untitled'),
+                            'description': entry.get('description', '') or '',
+                            'thumbnail': entry.get('thumbnail', '') or '',
+                            'duration': entry.get('duration', 0) or 0,
+                            'view_count': entry.get('view_count', 0) or 0,
+                            'like_count': entry.get('like_count', 0) or 0,
+                        })
+            
+            print(f"Found {len(videos)} videos")
+            return {"videos": videos, "total": len(videos)}
+            
+    except Exception as e:
+        print(f"List videos failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/process-selected")
+async def process_selected(request: ProcessSelectedRequest):
+    """Process a list of selected videos"""
+    print(f"Processing {len(request.videos)} selected videos")
+    
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+    
+    # Process first 3 immediately, queue the rest
+    results = []
+    queued = 0
+    
+    for i, video in enumerate(request.videos):
+        # Create queue entry
+        entry = supabase.table("processing_queue").insert({
+            "user_id": request.user_id,
+            "source_id": request.source_id,
+            "job_type": "download_video",
+            "status": "pending",
+            "payload": {
+                "video_url": video.url,
+                "title": video.title,
+                "description": video.description,
+                "thumbnail": video.thumbnail,
+                "duration": video.duration,
+                "view_count": video.view_count,
+                "like_count": video.like_count,
+            }
+        }).execute()
+        queue_id = entry.data[0]['id']
+        
+        if i < 3:
+            # Process immediately
+            metadata_override = {
+                'title': video.title,
+                'description': video.description,
+                'thumbnail': video.thumbnail,
+                'duration': video.duration,
+                'view_count': video.view_count,
+                'like_count': video.like_count,
+            }
+            result = process_single_video(video.url, request.user_id, request.source_id, queue_id, metadata_override)
+            results.append(result)
+        else:
+            queued += 1
+    
+    # Update source last_synced
+    supabase.table("sources").update({
+        "last_synced_at": datetime.utcnow().isoformat()
+    }).eq("id", request.source_id).execute()
+    
+    successful = len([r for r in results if r.get("success")])
+    
+    return {
+        "status": "completed",
+        "processed": successful,
+        "queued": queued,
+        "results": results
+    }
 
 @app.post("/process")
 async def process_video(request: VideoProcessRequest):
@@ -433,7 +579,8 @@ async def sync_profile(request: ProfileSyncRequest):
                             videos.append({
                                 'url': video_url,
                                 'id': video_id,
-                                'title': entry.get('title', 'Unknown')
+                                'title': entry.get('title', 'Unknown'),
+                                'description': entry.get('description', ''),
                             })
             
             print(f"Found {len(videos)} videos")
@@ -447,7 +594,7 @@ async def sync_profile(request: ProfileSyncRequest):
                     "source_id": request.source_id,
                     "job_type": "download_video",
                     "status": "pending",
-                    "payload": {"video_url": video['url'], "title": video['title']}
+                    "payload": {"video_url": video['url'], "title": video['title'], "description": video.get('description', '')}
                 }).execute()
                 queue_id = entry.data[0]['id']
                 
@@ -464,7 +611,7 @@ async def sync_profile(request: ProfileSyncRequest):
                         "source_id": request.source_id,
                         "job_type": "download_video",
                         "status": "pending",
-                        "payload": {"video_url": video['url'], "title": video['title']}
+                        "payload": {"video_url": video['url'], "title": video['title'], "description": video.get('description', '')}
                     }).execute()
                     queued += 1
                 except:
@@ -504,11 +651,20 @@ async def process_pending():
         video_url = payload.get("video_url")
         
         if video_url:
+            metadata_override = {
+                'title': payload.get('title'),
+                'description': payload.get('description'),
+                'thumbnail': payload.get('thumbnail'),
+                'duration': payload.get('duration'),
+                'view_count': payload.get('view_count'),
+                'like_count': payload.get('like_count'),
+            }
             result = process_single_video(
                 video_url,
                 item["user_id"],
                 item.get("source_id"),
-                item["id"]
+                item["id"],
+                metadata_override
             )
             results.append(result)
     
