@@ -5,7 +5,7 @@ Deploy this to Render, Railway, or any VPS with Python support.
 
 This server handles:
 1. Video downloading via yt-dlp (TikTok, YouTube, Instagram)
-2. Audio transcription via Google Gemini
+2. Audio transcription via Google Gemini (FREE with API key)
 3. Knowledge extraction via Gemini
 4. Pushing results back to your v0 app via webhooks
 
@@ -22,6 +22,7 @@ import json
 import asyncio
 import hashlib
 import hmac
+import tempfile
 from datetime import datetime
 from typing import Optional, List
 import uvicorn
@@ -55,7 +56,7 @@ if SUPABASE_URL and SUPABASE_SERVICE_KEY:
 app = FastAPI(
     title="KnowledgeFlow Processing Engine",
     description="Video processing, transcription, and knowledge extraction API",
-    version="1.2.0"
+    version="1.3.0"
 )
 
 app.add_middleware(
@@ -122,7 +123,7 @@ async def send_webhook(event: str, data: dict):
 def update_queue_status(queue_id: str, status: str, result: dict = None, error: str = None):
     if not queue_id or not supabase:
         return
-    update_data = {"status": status}
+    update_data = {"status": status, "updated_at": datetime.utcnow().isoformat()}
     if status == "processing":
         update_data["started_at"] = datetime.utcnow().isoformat()
     elif status in ["completed", "failed"]:
@@ -185,17 +186,25 @@ def download_video(video_url: str) -> tuple[str, dict]:
         return file_path, metadata
 
 def transcribe_audio(file_path: str) -> dict:
-    """Transcribe audio using Google Gemini"""
+    """Transcribe audio using Google Gemini - FREE with API key"""
     try:
+        if not os.path.exists(file_path):
+            print(f"Audio file not found: {file_path}")
+            return {'text': '', 'language': 'en'}
+        
+        print(f"Uploading audio for transcription: {file_path}")
         audio_file = genai.upload_file(file_path, mime_type="audio/mp3")
+        
         model = genai.GenerativeModel('gemini-1.5-flash')
         
-        prompt = """Transcribe this audio completely. Return JSON:
+        prompt = """Transcribe this audio completely and accurately. 
+Return ONLY a JSON object with this exact format:
 {
-    "text": "Full transcription",
-    "language": "en",
-    "duration": 60
-}"""
+    "text": "The complete transcription of all spoken words",
+    "language": "en"
+}
+
+Important: Include ALL spoken words in the transcription. Do not summarize."""
         
         response = model.generate_content(
             [audio_file, prompt],
@@ -206,39 +215,55 @@ def transcribe_audio(file_path: str) -> dict:
         )
         
         result = json.loads(response.text)
-        audio_file.delete()
-        return {'text': result.get('text', ''), 'language': result.get('language', 'en')}
+        
+        # Clean up uploaded file
+        try:
+            audio_file.delete()
+        except:
+            pass
+        
+        transcription = result.get('text', '')
+        print(f"Transcription complete: {len(transcription)} characters")
+        
+        return {'text': transcription, 'language': result.get('language', 'en')}
+        
     except Exception as e:
         print(f"Transcription error: {e}")
         return {'text': '', 'language': 'en'}
 
 def extract_knowledge_atoms(transcript: str, video_metadata: dict) -> tuple:
-    """Extract knowledge atoms from transcript"""
+    """Extract knowledge atoms from transcript using Gemini"""
     if not transcript or len(transcript) < 50:
+        print(f"Transcript too short for extraction: {len(transcript) if transcript else 0} chars")
         return [], "", []
     
-    prompt = f"""Analyze this transcript and extract Knowledge Atoms.
+    prompt = f"""Analyze this video transcript and extract Knowledge Atoms - key pieces of information that someone could learn from.
 
-TITLE: {video_metadata.get('title', 'Unknown')}
+VIDEO TITLE: {video_metadata.get('title', 'Unknown')}
+VIDEO DESCRIPTION: {video_metadata.get('description', '')[:500]}
 TRANSCRIPT: {transcript[:6000]}
 
-Return JSON:
+Return a JSON object with this exact format:
 {{
     "atoms": [
         {{
             "type": "concept",
-            "title": "Clear title",
-            "content": "2-3 sentence explanation",
-            "summary": "One sentence",
+            "title": "Clear, concise title for this knowledge",
+            "content": "2-3 sentence explanation of the concept or insight",
+            "summary": "One sentence summary",
             "difficulty_level": 2,
-            "tags": ["tag1", "tag2"]
+            "tags": ["relevant", "tags"]
         }}
     ],
-    "video_summary": "2 sentence summary",
-    "main_topics": ["topic1", "topic2"]
+    "video_summary": "2-3 sentence summary of the entire video",
+    "main_topics": ["topic1", "topic2", "topic3"]
 }}
 
-Extract 3-6 knowledge atoms."""
+Extract 3-8 meaningful knowledge atoms. Focus on:
+- Key concepts explained
+- Insights and wisdom shared  
+- Practical advice given
+- Important facts mentioned"""
 
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
@@ -250,7 +275,9 @@ Extract 3-6 knowledge atoms."""
             )
         )
         result = json.loads(response.text)
-        return result.get('atoms', []), result.get('video_summary', ''), result.get('main_topics', [])
+        atoms = result.get('atoms', [])
+        print(f"Extracted {len(atoms)} knowledge atoms")
+        return atoms, result.get('video_summary', ''), result.get('main_topics', [])
     except Exception as e:
         print(f"Extraction error: {e}")
         return [], "", []
@@ -262,12 +289,13 @@ def process_single_video(video_url: str, user_id: str, source_id: str, queue_id:
     
     try:
         update_queue_status(queue_id, "processing")
+        print(f"\n{'='*50}")
         print(f"Processing: {video_url}")
         
         # 1. Download
         file_path, metadata = download_video(video_url)
         
-        # Override metadata if provided (from list-videos)
+        # Override metadata if provided
         if metadata_override:
             metadata['title'] = metadata_override.get('title') or metadata['title']
             metadata['description'] = metadata_override.get('description') or metadata['description']
@@ -278,11 +306,12 @@ def process_single_video(video_url: str, user_id: str, source_id: str, queue_id:
         
         print(f"Downloaded: {metadata['title']}")
         
-        # 2. Transcribe
+        # 2. Transcribe using Gemini
         transcript_data = transcribe_audio(file_path)
-        print(f"Transcribed: {len(transcript_data['text'])} chars")
+        transcription_text = transcript_data.get('text', '')
+        print(f"Transcribed: {len(transcription_text)} characters")
         
-        # 3. Save video to database
+        # 3. Save video to database with transcription
         video_data = {
             "user_id": user_id,
             "source_id": source_id,
@@ -290,12 +319,14 @@ def process_single_video(video_url: str, user_id: str, source_id: str, queue_id:
             "video_id": metadata['video_id'],
             "video_url": video_url,
             "title": metadata['title'],
-            "description": (metadata.get('description') or '')[:2000],  # Allow longer descriptions
+            "description": (metadata.get('description') or '')[:2000],
             "thumbnail_url": metadata['thumbnail'],
             "duration_seconds": metadata['duration'],
             "view_count": metadata.get('view_count', 0),
             "like_count": metadata.get('like_count', 0),
-            "transcript_raw": transcript_data['text'],
+            # Save transcription to BOTH columns for compatibility
+            "transcription": transcription_text,
+            "transcript_raw": transcription_text,
             "language": transcript_data.get('language', 'en'),
             "processing_status": "extracting"
         }
@@ -306,17 +337,17 @@ def process_single_video(video_url: str, user_id: str, source_id: str, queue_id:
         if existing.data:
             video_db_id = existing.data[0]['id']
             supabase.table("videos").update(video_data).eq("id", video_db_id).execute()
+            print(f"Updated existing video: {video_db_id}")
         else:
             result = supabase.table("videos").insert(video_data).execute()
             video_db_id = result.data[0]['id']
-        
-        print(f"Saved video: {video_db_id}")
+            print(f"Created new video: {video_db_id}")
         
         # 4. Extract knowledge atoms
-        atoms, summary, topics = extract_knowledge_atoms(transcript_data['text'], metadata)
+        atoms, summary, topics = extract_knowledge_atoms(transcription_text, metadata)
         print(f"Extracted {len(atoms)} atoms")
         
-        # 5. Save atoms
+        # 5. Save atoms to database
         saved_count = 0
         for atom in atoms:
             atom_data = {
@@ -337,338 +368,214 @@ def process_single_video(video_url: str, user_id: str, source_id: str, queue_id:
             except Exception as e:
                 print(f"Atom save error: {e}")
         
-        # 6. Update video status
+        # 6. Update video status to completed
         supabase.table("videos").update({
             "processing_status": "completed",
             "processed_at": datetime.utcnow().isoformat()
         }).eq("id", video_db_id).execute()
         
-        update_queue_status(queue_id, "completed", result={"video_id": video_db_id, "atoms": saved_count})
+        update_queue_status(queue_id, "completed", result={"video_id": video_db_id, "atoms_created": saved_count})
         
-        print(f"SUCCESS: {metadata['title']} - {saved_count} atoms")
+        print(f"SUCCESS: {metadata['title']} - {saved_count} atoms created")
+        print(f"{'='*50}\n")
+        
         return {"success": True, "video_id": video_db_id, "atoms": saved_count, "title": metadata['title']}
         
     except Exception as e:
         error_msg = str(e)
-        print(f"FAILED: {error_msg}")
+        print(f"ERROR processing video: {error_msg}")
+        update_queue_status(queue_id, "failed", error=error_msg)
         
         if video_db_id:
             try:
-                supabase.table("videos").update({
-                    "processing_status": "failed",
-                    "processing_error": error_msg
-                }).eq("id", video_db_id).execute()
+                supabase.table("videos").update({"processing_status": "failed"}).eq("id", video_db_id).execute()
             except:
                 pass
         
-        update_queue_status(queue_id, "failed", error=error_msg)
         return {"success": False, "error": error_msg}
-        
+    
     finally:
+        # Clean up downloaded file
         if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
             except:
                 pass
 
+
 # API Endpoints
+
 @app.get("/")
-async def root():
-    return {
-        "status": "healthy",
-        "version": "1.2.0",
-        "services": {
-            "google_ai": bool(GOOGLE_API_KEY),
-            "supabase": bool(supabase),
-            "webhook": bool(V0_WEBHOOK_URL)
-        }
-    }
+def root():
+    return {"status": "ok", "service": "KnowledgeFlow Engine", "version": "1.3.0"}
 
 @app.get("/health")
-async def health():
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
-
-@app.post("/list-videos")
-async def list_videos(request: ListVideosRequest):
-    """List all videos from a profile without downloading - returns metadata only"""
-    print(f"Listing videos for @{request.username} on {request.platform}")
-    
-    # Build profile URL
-    if request.platform == "tiktok":
-        profile_url = f"https://www.tiktok.com/@{request.username}"
-    elif request.platform == "youtube":
-        profile_url = f"https://www.youtube.com/@{request.username}/videos"
-    else:
-        raise HTTPException(status_code=400, detail=f"Unsupported platform: {request.platform}")
-    
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': 'in_playlist',
-        'playlistend': request.max_videos,
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-    }
-    
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(profile_url, download=False)
-            
-            videos = []
-            if 'entries' in info:
-                for entry in info['entries']:
-                    if entry:
-                        video_id = entry.get('id', '')
-                        
-                        # Build video URL
-                        if request.platform == "tiktok":
-                            video_url = f"https://www.tiktok.com/@{request.username}/video/{video_id}"
-                        else:
-                            video_url = entry.get('url') or f"https://www.youtube.com/watch?v={video_id}"
-                        
-                        videos.append({
-                            'id': video_id,
-                            'url': video_url,
-                            'title': entry.get('title', 'Untitled'),
-                            'description': entry.get('description', '') or '',
-                            'thumbnail': entry.get('thumbnail', '') or '',
-                            'duration': entry.get('duration', 0) or 0,
-                            'view_count': entry.get('view_count', 0) or 0,
-                            'like_count': entry.get('like_count', 0) or 0,
-                        })
-            
-            print(f"Found {len(videos)} videos")
-            return {"videos": videos, "total": len(videos)}
-            
-    except Exception as e:
-        print(f"List videos failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/process-selected")
-async def process_selected(request: ProcessSelectedRequest):
-    """Process a list of selected videos"""
-    print(f"Processing {len(request.videos)} selected videos")
-    
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
-    
-    # Process first 3 immediately, queue the rest
-    results = []
-    queued = 0
-    
-    for i, video in enumerate(request.videos):
-        # Create queue entry
-        entry = supabase.table("processing_queue").insert({
-            "user_id": request.user_id,
-            "source_id": request.source_id,
-            "job_type": "download_video",
-            "status": "pending",
-            "payload": {
-                "video_url": video.url,
-                "title": video.title,
-                "description": video.description,
-                "thumbnail": video.thumbnail,
-                "duration": video.duration,
-                "view_count": video.view_count,
-                "like_count": video.like_count,
-            }
-        }).execute()
-        queue_id = entry.data[0]['id']
-        
-        if i < 3:
-            # Process immediately
-            metadata_override = {
-                'title': video.title,
-                'description': video.description,
-                'thumbnail': video.thumbnail,
-                'duration': video.duration,
-                'view_count': video.view_count,
-                'like_count': video.like_count,
-            }
-            result = process_single_video(video.url, request.user_id, request.source_id, queue_id, metadata_override)
-            results.append(result)
-        else:
-            queued += 1
-    
-    # Update source last_synced
-    supabase.table("sources").update({
-        "last_synced_at": datetime.utcnow().isoformat()
-    }).eq("id", request.source_id).execute()
-    
-    successful = len([r for r in results if r.get("success")])
-    
+def health():
     return {
-        "status": "completed",
-        "processed": successful,
-        "queued": queued,
-        "results": results
+        "status": "healthy",
+        "google_ai": "connected" if GOOGLE_API_KEY else "missing",
+        "supabase": "connected" if supabase else "missing",
+        "webhook_url": V0_WEBHOOK_URL[:50] + "..." if V0_WEBHOOK_URL else "not set"
     }
-
-@app.post("/process")
-async def process_video(request: VideoProcessRequest):
-    """Process a single video synchronously"""
-    if not request.video_url:
-        raise HTTPException(status_code=400, detail="video_url is required")
-    
-    # Create queue entry
-    queue_id = request.queue_id
-    if not queue_id and supabase:
-        entry = supabase.table("processing_queue").insert({
-            "user_id": request.user_id,
-            "job_type": "process_video",
-            "status": "pending",
-            "payload": {"video_url": request.video_url}
-        }).execute()
-        queue_id = entry.data[0]['id']
-    
-    # Process synchronously
-    result = process_single_video(request.video_url, request.user_id, request.source_id, queue_id)
-    
-    if result["success"]:
-        await send_webhook("processing_completed", {
-            "video_id": result["video_id"],
-            "atoms_created": result["atoms"],
-            "user_id": request.user_id
-        })
-    
-    return result
 
 @app.post("/sync-profile")
 async def sync_profile(request: ProfileSyncRequest):
-    """Sync videos from a profile - processes first 3 immediately, queues rest"""
-    print(f"Syncing: @{request.username} on {request.platform}")
-    
-    # Build profile URL
-    if request.platform == "tiktok":
-        profile_url = f"https://www.tiktok.com/@{request.username}"
-    elif request.platform == "youtube":
-        profile_url = f"https://www.youtube.com/@{request.username}/videos"
-    else:
-        raise HTTPException(status_code=400, detail=f"Unsupported platform: {request.platform}")
-    
-    # Get video list
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': True,
-        'playlistend': min(request.max_videos, 50),
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-    }
-    
+    """Sync a TikTok/YouTube profile - fetch videos and process first 3"""
     try:
+        print(f"\nSyncing profile: @{request.username} on {request.platform}")
+        
+        # Build profile URL
+        if request.platform == "tiktok":
+            profile_url = f"https://www.tiktok.com/@{request.username}"
+        elif request.platform == "youtube":
+            profile_url = f"https://www.youtube.com/@{request.username}/videos"
+        else:
+            raise HTTPException(400, f"Unsupported platform: {request.platform}")
+        
+        # Fetch video list
+        ydl_opts = {
+            'extract_flat': True,
+            'quiet': True,
+            'no_warnings': True,
+            'playlist_items': f'1-{request.max_videos}'
+        }
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(profile_url, download=False)
-            
-            videos = []
-            if 'entries' in info:
-                for entry in info['entries']:
-                    if entry:
-                        video_url = entry.get('url') or entry.get('webpage_url')
-                        video_id = entry.get('id')
-                        
-                        if not video_url and video_id:
-                            if request.platform == "tiktok":
-                                video_url = f"https://www.tiktok.com/@{request.username}/video/{video_id}"
-                            else:
-                                video_url = f"https://www.youtube.com/watch?v={video_id}"
-                        
-                        if video_url:
-                            videos.append({
-                                'url': video_url,
-                                'id': video_id,
-                                'title': entry.get('title', 'Unknown'),
-                                'description': entry.get('description', ''),
-                            })
-            
-            print(f"Found {len(videos)} videos")
-            
-            # Process first 3 videos immediately
-            processed = []
-            for video in videos[:3]:
-                # Create queue entry
-                entry = supabase.table("processing_queue").insert({
-                    "user_id": request.user_id,
-                    "source_id": request.source_id,
-                    "job_type": "download_video",
-                    "status": "pending",
-                    "payload": {"video_url": video['url'], "title": video['title'], "description": video.get('description', '')}
-                }).execute()
-                queue_id = entry.data[0]['id']
-                
-                # Process immediately
-                result = process_single_video(video['url'], request.user_id, request.source_id, queue_id)
+            entries = info.get('entries', [])
+        
+        print(f"Found {len(entries)} videos")
+        
+        # Process first 3 videos synchronously
+        processed = []
+        for i, entry in enumerate(entries[:3]):
+            video_url = entry.get('url') or entry.get('webpage_url')
+            if video_url:
+                result = process_single_video(
+                    video_url=video_url,
+                    user_id=request.user_id,
+                    source_id=request.source_id
+                )
                 processed.append(result)
-            
-            # Queue remaining videos (just create entries, don't process)
-            queued = 0
-            for video in videos[3:]:
+        
+        # Queue remaining videos
+        queued = 0
+        for entry in entries[3:]:
+            video_url = entry.get('url') or entry.get('webpage_url')
+            if video_url and supabase:
                 try:
                     supabase.table("processing_queue").insert({
                         "user_id": request.user_id,
                         "source_id": request.source_id,
-                        "job_type": "download_video",
+                        "job_type": "process_video",
                         "status": "pending",
-                        "payload": {"video_url": video['url'], "title": video['title'], "description": video.get('description', '')}
+                        "priority": 5,
+                        "payload": {
+                            "video_url": video_url,
+                            "title": entry.get('title', 'Unknown')
+                        }
                     }).execute()
                     queued += 1
-                except:
-                    pass
-            
-            # Update source last_synced
+                except Exception as e:
+                    print(f"Queue error: {e}")
+        
+        # Update source
+        if supabase:
             supabase.table("sources").update({
+                "video_count": len(entries),
                 "last_synced_at": datetime.utcnow().isoformat()
             }).eq("id", request.source_id).execute()
-            
-            successful = [p for p in processed if p.get("success")]
-            
-            return {
-                "status": "completed",
-                "found": len(videos),
-                "processed_immediately": len(successful),
-                "queued_for_later": queued,
-                "results": processed
-            }
-            
+        
+        return {
+            "success": True,
+            "total_videos": len(entries),
+            "processed": len([p for p in processed if p.get('success')]),
+            "queued": queued
+        }
+        
     except Exception as e:
-        print(f"Sync failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Sync error: {e}")
+        raise HTTPException(500, str(e))
 
 @app.post("/process-pending")
-async def process_pending():
-    """Process pending queue items - call this periodically"""
+async def process_pending(limit: int = 5):
+    """Process pending videos from the queue"""
     if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
+        raise HTTPException(500, "Database not connected")
     
     # Get pending items
-    pending = supabase.table("processing_queue").select("*").eq("status", "pending").limit(5).execute()
+    result = supabase.table("processing_queue")\
+        .select("*")\
+        .eq("status", "pending")\
+        .order("priority", desc=True)\
+        .order("created_at")\
+        .limit(limit)\
+        .execute()
     
-    results = []
-    for item in pending.data:
-        payload = item.get("payload", {})
-        video_url = payload.get("video_url")
+    pending = result.data or []
+    print(f"\nProcessing {len(pending)} pending videos")
+    
+    processed = []
+    for item in pending:
+        payload = item.get('payload', {})
+        video_url = payload.get('video_url')
         
         if video_url:
-            metadata_override = {
-                'title': payload.get('title'),
-                'description': payload.get('description'),
-                'thumbnail': payload.get('thumbnail'),
-                'duration': payload.get('duration'),
-                'view_count': payload.get('view_count'),
-                'like_count': payload.get('like_count'),
-            }
             result = process_single_video(
-                video_url,
-                item["user_id"],
-                item.get("source_id"),
-                item["id"],
-                metadata_override
+                video_url=video_url,
+                user_id=item['user_id'],
+                source_id=item.get('source_id'),
+                queue_id=item['id']
             )
-            results.append(result)
+            processed.append(result)
     
-    return {"processed": len(results), "results": results}
+    return {
+        "success": True,
+        "processed": len(processed),
+        "results": processed
+    }
+
+@app.post("/list-videos")
+async def list_videos(request: ListVideosRequest):
+    """List available videos from a profile without downloading"""
+    try:
+        if request.platform == "tiktok":
+            url = f"https://www.tiktok.com/@{request.username}"
+        elif request.platform == "youtube":
+            url = f"https://www.youtube.com/@{request.username}/videos"
+        else:
+            raise HTTPException(400, f"Unsupported platform: {request.platform}")
+        
+        ydl_opts = {
+            'extract_flat': 'in_playlist',
+            'quiet': True,
+            'no_warnings': True,
+            'playlist_items': f'1-{request.max_videos}'
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            entries = info.get('entries', [])
+        
+        videos = []
+        for entry in entries:
+            videos.append({
+                "url": entry.get('url') or entry.get('webpage_url', ''),
+                "title": entry.get('title', 'Untitled'),
+                "description": entry.get('description', ''),
+                "thumbnail": entry.get('thumbnail', ''),
+                "duration": entry.get('duration', 0),
+                "view_count": entry.get('view_count', 0),
+                "like_count": entry.get('like_count', 0)
+            })
+        
+        return {"success": True, "videos": videos, "total": len(videos)}
+        
+    except Exception as e:
+        print(f"List videos error: {e}")
+        raise HTTPException(500, str(e))
+
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
