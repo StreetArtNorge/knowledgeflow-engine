@@ -194,8 +194,50 @@ def download_video(video_url: str) -> tuple[str, dict]:
         return file_path, metadata
 
 
-def transcribe_audio(file_path: str) -> dict:
-    """Transcribe audio using Google Gemini - FREE with API key"""
+def get_user_ai_settings(user_id: str) -> dict:
+    """Fetch user's AI settings from the database"""
+    default_settings = {
+        "transcription_prompt": "Transcribe this video accurately. Include speaker emotions and tone indicators in [brackets]. Preserve the natural flow and pauses.",
+        "extraction_prompt": """Extract knowledge atoms from this transcription. Focus on: key insights, practical techniques, memorable quotes, and actionable advice.
+
+For each piece of knowledge, create a structured entry with:
+- A clear, concise title
+- The main content/insight  
+- A brief summary suitable for a flashcard
+- Difficulty level (1-5)
+- Relevant tags
+
+Format as JSON array.""",
+        "model": "gemini-1.5-flash",
+        "temperature": 0.3,
+        "max_tokens": 8192,
+        "extraction_categories": ["insights", "techniques", "quotes", "advice"]
+    }
+    
+    try:
+        if not supabase:
+            return default_settings
+            
+        result = supabase.table("ai_settings").select("*").eq("user_id", user_id).execute()
+        
+        if result.data and len(result.data) > 0:
+            settings = result.data[0]
+            return {
+                "transcription_prompt": settings.get("transcription_prompt") or default_settings["transcription_prompt"],
+                "extraction_prompt": settings.get("extraction_prompt") or default_settings["extraction_prompt"],
+                "model": settings.get("model") or default_settings["model"],
+                "temperature": float(settings.get("temperature") or default_settings["temperature"]),
+                "max_tokens": int(settings.get("max_tokens") or default_settings["max_tokens"]),
+                "extraction_categories": settings.get("extraction_categories") or default_settings["extraction_categories"]
+            }
+    except Exception as e:
+        print(f"[SETTINGS] Error fetching settings: {e}")
+    
+    return default_settings
+
+
+def transcribe_audio_with_settings(file_path: str, settings: dict) -> dict:
+    """Transcribe audio using Google Gemini with user's custom prompt"""
     try:
         if not os.path.exists(file_path):
             print(f"[TRANSCRIBE] File not found: {file_path}")
@@ -225,16 +267,18 @@ def transcribe_audio(file_path: str) -> dict:
         
         print("[TRANSCRIBE] Generating transcript...")
         
-        # Generate transcription using Gemini
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # Use user's custom prompt and model
+        model_name = settings.get("model", "gemini-1.5-flash")
+        custom_prompt = settings.get("transcription_prompt", "Transcribe this video accurately.")
+        
+        model = genai.GenerativeModel(model_name)
         response = model.generate_content(
-            [uploaded_file, "Generate a complete and accurate transcript of all spoken words in this audio. Return ONLY the transcript text, nothing else. If no speech is detected, return 'No speech detected'."],
+            [uploaded_file, f"{custom_prompt}\n\nReturn ONLY the transcript text, nothing else. If no speech is detected, return 'No speech detected'."],
             generation_config=genai.GenerationConfig(temperature=0.1)
         )
         
         transcription = response.text.strip() if response.text else ""
         
-        # Check for "no speech" response
         if "no speech" in transcription.lower() or len(transcription) < 10:
             print("[TRANSCRIBE] No speech detected or very short response")
             transcription = ""
@@ -256,60 +300,75 @@ def transcribe_audio(file_path: str) -> dict:
         return {'text': '', 'language': 'en'}
 
 
-def extract_knowledge_atoms(transcript: str, video_metadata: dict) -> tuple:
-    """Extract knowledge atoms from transcript using Gemini"""
-    if not transcript or len(transcript) < 50:
-        print(f"[EXTRACT] Transcript too short: {len(transcript) if transcript else 0} chars")
-        return [], "", []
-    
-    if not GOOGLE_API_KEY:
-        print("[EXTRACT] No Google API key configured")
-        return [], "", []
-    
-    prompt = f"""Analyze this video transcript and extract Knowledge Atoms - key pieces of information that someone could learn from.
-
-VIDEO TITLE: {video_metadata.get('title', 'Unknown')}
-VIDEO DESCRIPTION: {video_metadata.get('description', '')[:500]}
-TRANSCRIPT: {transcript[:6000]}
-
-Return a JSON object with this exact format:
-{{
-    "atoms": [
-        {{
-            "type": "concept",
-            "title": "Clear, concise title for this knowledge",
-            "content": "2-3 sentence explanation of the concept or insight",
-            "summary": "One sentence summary",
-            "difficulty_level": 2,
-            "tags": ["relevant", "tags"]
-        }}
-    ],
-    "video_summary": "2-3 sentence summary of the entire video",
-    "main_topics": ["topic1", "topic2", "topic3"]
-}}
-
-Extract 3-8 meaningful knowledge atoms. Focus on:
-- Key concepts explained
-- Insights and wisdom shared  
-- Practical advice given
-- Important facts mentioned"""
-
+def extract_knowledge_atoms_with_settings(transcription: str, metadata: dict, settings: dict) -> tuple:
+    """Extract knowledge atoms using user's custom prompt"""
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        if not GOOGLE_API_KEY or not transcription:
+            return [], "", []
+        
+        model_name = settings.get("model", "gemini-1.5-flash")
+        custom_prompt = settings.get("extraction_prompt", "Extract knowledge atoms from this transcription.")
+        temperature = settings.get("temperature", 0.3)
+        categories = settings.get("extraction_categories", ["insights", "techniques", "quotes", "advice"])
+        
+        model = genai.GenerativeModel(model_name)
+        
+        full_prompt = f"""{custom_prompt}
+
+Categories to extract: {', '.join(categories)}
+
+Video Title: {metadata.get('title', 'Unknown')}
+Video Description: {metadata.get('description', '')[:500]}
+
+Transcription:
+{transcription}
+
+Return a JSON array of knowledge atoms. Each atom should have:
+- type: one of {categories}
+- title: brief title (max 100 chars)
+- content: the full insight/knowledge (max 500 chars)
+- summary: one sentence summary for flashcard
+- difficulty_level: 1-5 (1=beginner, 5=expert)
+- tags: array of relevant tags
+
+Return ONLY valid JSON array, no other text."""
+
         response = model.generate_content(
-            prompt,
+            full_prompt,
             generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                temperature=0.3
+                temperature=temperature,
+                response_mime_type="application/json"
             )
         )
         
-        result = json.loads(response.text)
-        atoms = result.get('atoms', [])
-        print(f"[EXTRACT] Extracted {len(atoms)} knowledge atoms")
-        return atoms, result.get('video_summary', ''), result.get('main_topics', [])
+        # Parse JSON response
+        atoms = []
+        try:
+            result_text = response.text.strip()
+            if result_text.startswith('['):
+                atoms = json.loads(result_text)
+            else:
+                # Try to extract JSON array
+                import re
+                json_match = re.search(r'\[[\s\S]*\]', result_text)
+                if json_match:
+                    atoms = json.loads(json_match.group())
+        except json.JSONDecodeError as e:
+            print(f"[EXTRACT] JSON parse error: {e}")
+        
+        # Generate summary
+        summary = f"Extracted {len(atoms)} knowledge atoms from {metadata.get('title', 'video')}"
+        
+        # Extract topics from atoms
+        topics = list(set([atom.get('type', 'insight') for atom in atoms]))
+        
+        print(f"[EXTRACT] Found {len(atoms)} atoms, topics: {topics}")
+        return atoms, summary, topics
+        
     except Exception as e:
         print(f"[EXTRACT] Error: {e}")
+        import traceback
+        traceback.print_exc()
         return [], "", []
 
 
@@ -338,9 +397,12 @@ def process_single_video(video_url: str, user_id: str, source_id: str, queue_id:
         
         print(f"[PROCESS] Downloaded: {metadata['title']}")
         
+        # Fetch user's AI settings
+        settings = get_user_ai_settings(user_id)
+        
         # 2. Transcribe using Gemini
         print("[PROCESS] Step 2: Transcribing with Gemini...")
-        transcript_data = transcribe_audio(file_path)
+        transcript_data = transcribe_audio_with_settings(file_path, settings)
         transcription_text = transcript_data.get('text', '')
         print(f"[PROCESS] Transcribed: {len(transcription_text)} characters")
         
@@ -379,7 +441,7 @@ def process_single_video(video_url: str, user_id: str, source_id: str, queue_id:
         atoms_saved = 0
         if transcription_text and len(transcription_text) >= 50:
             print("[PROCESS] Step 4: Extracting knowledge atoms...")
-            atoms, summary, topics = extract_knowledge_atoms(transcription_text, metadata)
+            atoms, summary, topics = extract_knowledge_atoms_with_settings(transcription_text, metadata, settings)
             print(f"[PROCESS] Extracted {len(atoms)} atoms")
             
             # 5. Save atoms to database
