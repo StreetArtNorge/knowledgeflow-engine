@@ -1,32 +1,32 @@
 """
-KnowledgeFlow - Python Processing Engine
-========================================
-Deploy this to Render, Railway, or any VPS with Python support.
+KnowledgeFlow - Python Processing Engine v2.1
+=============================================
+Deploy this to Render with FFmpeg support.
 
-This server handles:
-1. Video downloading via yt-dlp (TikTok, YouTube, Instagram)
-2. Audio transcription via Google Gemini (FREE with API key)
-3. Knowledge extraction via Gemini
-4. Pushing results back to your v0 app via webhooks
+RENDER SETUP:
+1. Create a new Web Service from your GitHub repo
+2. Set Build Command: pip install -r requirements.txt
+3. Set Start Command: uvicorn server:app --host 0.0.0.0 --port $PORT
+4. Add these Environment Variables:
+   - GOOGLE_API_KEY: Your Google AI API key
+   - SUPABASE_URL: Your Supabase project URL
+   - SUPABASE_SERVICE_KEY: Your Supabase service role key
+   - WEBHOOK_SECRET: A secret key (any random string)
+   - V0_WEBHOOK_URL: https://your-v0-app.vercel.app/api/webhooks/processing
 
-ENVIRONMENT VARIABLES REQUIRED:
-- GOOGLE_API_KEY: Your Google AI API key (get from https://aistudio.google.com/app/apikey)
-- SUPABASE_URL: Your Supabase project URL
-- SUPABASE_SERVICE_KEY: Your Supabase service role key (not anon key!)
-- WEBHOOK_SECRET: A secret key to authenticate webhook calls
-- V0_WEBHOOK_URL: Your deployed v0 app webhook URL
+IMPORTANT: Add FFmpeg support in Render:
+- Go to Settings > Build & Deploy
+- Add to Build Command: apt-get update && apt-get install -y ffmpeg && pip install -r requirements.txt
 """
 
 import os
 import json
-import asyncio
 import hashlib
 import hmac
-import tempfile
 from datetime import datetime
 from typing import Optional, List
 import uvicorn
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import yt_dlp
@@ -44,7 +44,7 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "your-webhook-secret-here")
 V0_WEBHOOK_URL = os.getenv("V0_WEBHOOK_URL", "")
 
-# Initialize Google AI
+# Initialize Google GenAI
 if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
 
@@ -56,7 +56,7 @@ if SUPABASE_URL and SUPABASE_SERVICE_KEY:
 app = FastAPI(
     title="KnowledgeFlow Processing Engine",
     description="Video processing, transcription, and knowledge extraction API",
-    version="1.3.0"
+    version="2.1.0"
 )
 
 app.add_middleware(
@@ -100,9 +100,10 @@ class ProcessSelectedRequest(BaseModel):
     source_id: str
     user_id: str
 
-# Utility Functions
+
 def generate_webhook_signature(payload: str) -> str:
     return hmac.new(WEBHOOK_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
 
 async def send_webhook(event: str, data: dict):
     if not V0_WEBHOOK_URL:
@@ -118,7 +119,8 @@ async def send_webhook(event: str, data: dict):
                 "X-Webhook-Signature": signature
             }, timeout=30.0)
         except Exception as e:
-            print(f"Webhook failed: {e}")
+            print(f"[WEBHOOK] Failed: {e}")
+
 
 def update_queue_status(queue_id: str, status: str, result: dict = None, error: str = None):
     if not queue_id or not supabase:
@@ -135,7 +137,8 @@ def update_queue_status(queue_id: str, status: str, result: dict = None, error: 
     try:
         supabase.table("processing_queue").update(update_data).eq("id", queue_id).execute()
     except Exception as e:
-        print(f"Queue update failed: {e}")
+        print(f"[QUEUE] Update failed: {e}")
+
 
 def detect_platform(url: str) -> str:
     url_lower = url.lower()
@@ -146,6 +149,7 @@ def detect_platform(url: str) -> str:
     elif 'instagram' in url_lower:
         return 'instagram'
     return 'unknown'
+
 
 def download_video(video_url: str) -> tuple[str, dict]:
     """Download video audio using yt-dlp"""
@@ -166,6 +170,8 @@ def download_video(video_url: str) -> tuple[str, dict]:
         }
     }
     
+    print(f"[DOWNLOAD] Starting: {video_url}")
+    
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
         video_id = info.get('id', 'unknown')
@@ -183,58 +189,81 @@ def download_video(video_url: str) -> tuple[str, dict]:
             'platform': detect_platform(video_url),
             'original_url': video_url
         }
+        
+        print(f"[DOWNLOAD] Success: {metadata['title']}")
         return file_path, metadata
+
 
 def transcribe_audio(file_path: str) -> dict:
     """Transcribe audio using Google Gemini - FREE with API key"""
     try:
         if not os.path.exists(file_path):
-            print(f"Audio file not found: {file_path}")
+            print(f"[TRANSCRIBE] File not found: {file_path}")
             return {'text': '', 'language': 'en'}
         
-        print(f"Uploading audio for transcription: {file_path}")
-        audio_file = genai.upload_file(file_path, mime_type="audio/mp3")
+        if not GOOGLE_API_KEY:
+            print("[TRANSCRIBE] No Google API key configured")
+            return {'text': '', 'language': 'en'}
         
+        file_size = os.path.getsize(file_path)
+        print(f"[TRANSCRIBE] Uploading file: {file_path} ({file_size} bytes)")
+        
+        # Upload the audio file
+        uploaded_file = genai.upload_file(file_path)
+        print(f"[TRANSCRIBE] Uploaded: {uploaded_file.name}")
+        
+        # Wait for file to be processed
+        import time
+        while uploaded_file.state.name == "PROCESSING":
+            print("[TRANSCRIBE] Waiting for file processing...")
+            time.sleep(2)
+            uploaded_file = genai.get_file(uploaded_file.name)
+        
+        if uploaded_file.state.name == "FAILED":
+            print("[TRANSCRIBE] File processing failed")
+            return {'text': '', 'language': 'en'}
+        
+        print("[TRANSCRIBE] Generating transcript...")
+        
+        # Generate transcription using Gemini
         model = genai.GenerativeModel('gemini-1.5-flash')
-        
-        prompt = """Transcribe this audio completely and accurately. 
-Return ONLY a JSON object with this exact format:
-{
-    "text": "The complete transcription of all spoken words",
-    "language": "en"
-}
-
-Important: Include ALL spoken words in the transcription. Do not summarize."""
-        
         response = model.generate_content(
-            [audio_file, prompt],
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                temperature=0.1
-            )
+            [uploaded_file, "Generate a complete and accurate transcript of all spoken words in this audio. Return ONLY the transcript text, nothing else. If no speech is detected, return 'No speech detected'."],
+            generation_config=genai.GenerationConfig(temperature=0.1)
         )
         
-        result = json.loads(response.text)
+        transcription = response.text.strip() if response.text else ""
+        
+        # Check for "no speech" response
+        if "no speech" in transcription.lower() or len(transcription) < 10:
+            print("[TRANSCRIBE] No speech detected or very short response")
+            transcription = ""
+        
+        print(f"[TRANSCRIBE] Success: {len(transcription)} characters")
         
         # Clean up uploaded file
         try:
-            audio_file.delete()
+            genai.delete_file(uploaded_file.name)
         except:
             pass
         
-        transcription = result.get('text', '')
-        print(f"Transcription complete: {len(transcription)} characters")
-        
-        return {'text': transcription, 'language': result.get('language', 'en')}
+        return {'text': transcription, 'language': 'en'}
         
     except Exception as e:
-        print(f"Transcription error: {e}")
+        print(f"[TRANSCRIBE] Error: {e}")
+        import traceback
+        traceback.print_exc()
         return {'text': '', 'language': 'en'}
+
 
 def extract_knowledge_atoms(transcript: str, video_metadata: dict) -> tuple:
     """Extract knowledge atoms from transcript using Gemini"""
     if not transcript or len(transcript) < 50:
-        print(f"Transcript too short for extraction: {len(transcript) if transcript else 0} chars")
+        print(f"[EXTRACT] Transcript too short: {len(transcript) if transcript else 0} chars")
+        return [], "", []
+    
+    if not GOOGLE_API_KEY:
+        print("[EXTRACT] No Google API key configured")
         return [], "", []
     
     prompt = f"""Analyze this video transcript and extract Knowledge Atoms - key pieces of information that someone could learn from.
@@ -274,13 +303,15 @@ Extract 3-8 meaningful knowledge atoms. Focus on:
                 temperature=0.3
             )
         )
+        
         result = json.loads(response.text)
         atoms = result.get('atoms', [])
-        print(f"Extracted {len(atoms)} knowledge atoms")
+        print(f"[EXTRACT] Extracted {len(atoms)} knowledge atoms")
         return atoms, result.get('video_summary', ''), result.get('main_topics', [])
     except Exception as e:
-        print(f"Extraction error: {e}")
+        print(f"[EXTRACT] Error: {e}")
         return [], "", []
+
 
 def process_single_video(video_url: str, user_id: str, source_id: str, queue_id: str = None, metadata_override: dict = None) -> dict:
     """Process a single video synchronously - download, transcribe, extract, save"""
@@ -289,10 +320,11 @@ def process_single_video(video_url: str, user_id: str, source_id: str, queue_id:
     
     try:
         update_queue_status(queue_id, "processing")
-        print(f"\n{'='*50}")
-        print(f"Processing: {video_url}")
+        print(f"\n{'='*60}")
+        print(f"[PROCESS] Starting: {video_url}")
         
         # 1. Download
+        print("[PROCESS] Step 1: Downloading...")
         file_path, metadata = download_video(video_url)
         
         # Override metadata if provided
@@ -304,14 +336,16 @@ def process_single_video(video_url: str, user_id: str, source_id: str, queue_id:
             metadata['view_count'] = metadata_override.get('view_count') or metadata['view_count']
             metadata['like_count'] = metadata_override.get('like_count') or metadata['like_count']
         
-        print(f"Downloaded: {metadata['title']}")
+        print(f"[PROCESS] Downloaded: {metadata['title']}")
         
         # 2. Transcribe using Gemini
+        print("[PROCESS] Step 2: Transcribing with Gemini...")
         transcript_data = transcribe_audio(file_path)
         transcription_text = transcript_data.get('text', '')
-        print(f"Transcribed: {len(transcription_text)} characters")
+        print(f"[PROCESS] Transcribed: {len(transcription_text)} characters")
         
         # 3. Save video to database with transcription
+        print("[PROCESS] Step 3: Saving to database...")
         video_data = {
             "user_id": user_id,
             "source_id": source_id,
@@ -324,11 +358,9 @@ def process_single_video(video_url: str, user_id: str, source_id: str, queue_id:
             "duration_seconds": metadata['duration'],
             "view_count": metadata.get('view_count', 0),
             "like_count": metadata.get('like_count', 0),
-            # Save transcription to BOTH columns for compatibility
             "transcription": transcription_text,
-            "transcript_raw": transcription_text,
             "language": transcript_data.get('language', 'en'),
-            "processing_status": "extracting"
+            "processing_status": "extracting" if transcription_text else "completed"
         }
         
         # Check if video already exists
@@ -337,36 +369,40 @@ def process_single_video(video_url: str, user_id: str, source_id: str, queue_id:
         if existing.data:
             video_db_id = existing.data[0]['id']
             supabase.table("videos").update(video_data).eq("id", video_db_id).execute()
-            print(f"Updated existing video: {video_db_id}")
+            print(f"[PROCESS] Updated existing video: {video_db_id}")
         else:
             result = supabase.table("videos").insert(video_data).execute()
             video_db_id = result.data[0]['id']
-            print(f"Created new video: {video_db_id}")
+            print(f"[PROCESS] Created new video: {video_db_id}")
         
-        # 4. Extract knowledge atoms
-        atoms, summary, topics = extract_knowledge_atoms(transcription_text, metadata)
-        print(f"Extracted {len(atoms)} atoms")
-        
-        # 5. Save atoms to database
-        saved_count = 0
-        for atom in atoms:
-            atom_data = {
-                "user_id": user_id,
-                "video_id": video_db_id,
-                "atom_type": atom.get('type', 'concept'),
-                "title": atom.get('title', 'Insight'),
-                "content": atom.get('content', ''),
-                "summary": atom.get('summary'),
-                "difficulty_level": atom.get('difficulty_level', 2),
-                "tags": atom.get('tags', []),
-                "mastery_score": 0,
-                "times_reviewed": 0
-            }
-            try:
-                supabase.table("knowledge_atoms").insert(atom_data).execute()
-                saved_count += 1
-            except Exception as e:
-                print(f"Atom save error: {e}")
+        # 4. Extract knowledge atoms (only if we have transcription)
+        atoms_saved = 0
+        if transcription_text and len(transcription_text) >= 50:
+            print("[PROCESS] Step 4: Extracting knowledge atoms...")
+            atoms, summary, topics = extract_knowledge_atoms(transcription_text, metadata)
+            print(f"[PROCESS] Extracted {len(atoms)} atoms")
+            
+            # 5. Save atoms to database
+            for atom in atoms:
+                atom_data = {
+                    "user_id": user_id,
+                    "video_id": video_db_id,
+                    "atom_type": atom.get('type', 'concept'),
+                    "title": atom.get('title', 'Insight'),
+                    "content": atom.get('content', ''),
+                    "summary": atom.get('summary'),
+                    "difficulty_level": atom.get('difficulty_level', 2),
+                    "tags": atom.get('tags', []),
+                    "mastery_score": 0,
+                    "times_reviewed": 0
+                }
+                try:
+                    supabase.table("knowledge_atoms").insert(atom_data).execute()
+                    atoms_saved += 1
+                except Exception as e:
+                    print(f"[PROCESS] Atom save error: {e}")
+        else:
+            print("[PROCESS] Step 4: Skipping atom extraction (no transcription)")
         
         # 6. Update video status to completed
         supabase.table("videos").update({
@@ -374,16 +410,19 @@ def process_single_video(video_url: str, user_id: str, source_id: str, queue_id:
             "processed_at": datetime.utcnow().isoformat()
         }).eq("id", video_db_id).execute()
         
-        update_queue_status(queue_id, "completed", result={"video_id": video_db_id, "atoms_created": saved_count})
+        update_queue_status(queue_id, "completed", result={"video_id": video_db_id, "atoms_created": atoms_saved})
         
-        print(f"SUCCESS: {metadata['title']} - {saved_count} atoms created")
-        print(f"{'='*50}\n")
+        print(f"[PROCESS] SUCCESS: {metadata['title']} - {atoms_saved} atoms created")
+        print(f"{'='*60}\n")
         
-        return {"success": True, "video_id": video_db_id, "atoms": saved_count, "title": metadata['title']}
+        return {"success": True, "video_id": video_db_id, "atoms": atoms_saved, "title": metadata['title']}
         
     except Exception as e:
         error_msg = str(e)
-        print(f"ERROR processing video: {error_msg}")
+        print(f"[PROCESS] ERROR: {error_msg}")
+        import traceback
+        traceback.print_exc()
+        
         update_queue_status(queue_id, "failed", error=error_msg)
         
         if video_db_id:
@@ -407,22 +446,24 @@ def process_single_video(video_url: str, user_id: str, source_id: str, queue_id:
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "KnowledgeFlow Engine", "version": "1.3.0"}
+    return {"status": "ok", "service": "KnowledgeFlow Engine", "version": "2.1.0"}
+
 
 @app.get("/health")
 def health():
     return {
         "status": "healthy",
-        "google_ai": "connected" if GOOGLE_API_KEY else "missing",
-        "supabase": "connected" if supabase else "missing",
+        "google_ai": "connected" if GOOGLE_API_KEY else "missing GOOGLE_API_KEY",
+        "supabase": "connected" if supabase else "missing credentials",
         "webhook_url": V0_WEBHOOK_URL[:50] + "..." if V0_WEBHOOK_URL else "not set"
     }
+
 
 @app.post("/sync-profile")
 async def sync_profile(request: ProfileSyncRequest):
     """Sync a TikTok/YouTube profile - fetch videos and process first 3"""
     try:
-        print(f"\nSyncing profile: @{request.username} on {request.platform}")
+        print(f"\n[SYNC] Starting sync: @{request.username} on {request.platform}")
         
         # Build profile URL
         if request.platform == "tiktok":
@@ -444,13 +485,14 @@ async def sync_profile(request: ProfileSyncRequest):
             info = ydl.extract_info(profile_url, download=False)
             entries = info.get('entries', [])
         
-        print(f"Found {len(entries)} videos")
+        print(f"[SYNC] Found {len(entries)} videos")
         
         # Process first 3 videos synchronously
         processed = []
         for i, entry in enumerate(entries[:3]):
             video_url = entry.get('url') or entry.get('webpage_url')
             if video_url:
+                print(f"[SYNC] Processing video {i+1}/3: {entry.get('title', 'Unknown')}")
                 result = process_single_video(
                     video_url=video_url,
                     user_id=request.user_id,
@@ -477,7 +519,7 @@ async def sync_profile(request: ProfileSyncRequest):
                     }).execute()
                     queued += 1
                 except Exception as e:
-                    print(f"Queue error: {e}")
+                    print(f"[SYNC] Queue error: {e}")
         
         # Update source
         if supabase:
@@ -486,22 +528,30 @@ async def sync_profile(request: ProfileSyncRequest):
                 "last_synced_at": datetime.utcnow().isoformat()
             }).eq("id", request.source_id).execute()
         
+        success_count = len([p for p in processed if p.get('success')])
+        print(f"[SYNC] Complete: {success_count} processed, {queued} queued")
+        
         return {
             "success": True,
             "total_videos": len(entries),
-            "processed": len([p for p in processed if p.get('success')]),
+            "processed": success_count,
             "queued": queued
         }
         
     except Exception as e:
-        print(f"Sync error: {e}")
+        print(f"[SYNC] Error: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(500, str(e))
 
+
 @app.post("/process-pending")
-async def process_pending(limit: int = 5):
+async def process_pending(limit: int = Query(default=5, ge=1, le=20)):
     """Process pending videos from the queue"""
     if not supabase:
         raise HTTPException(500, "Database not connected")
+    
+    print(f"\n[PENDING] Processing up to {limit} pending videos...")
     
     # Get pending items
     result = supabase.table("processing_queue")\
@@ -513,14 +563,15 @@ async def process_pending(limit: int = 5):
         .execute()
     
     pending = result.data or []
-    print(f"\nProcessing {len(pending)} pending videos")
+    print(f"[PENDING] Found {len(pending)} pending items")
     
     processed = []
-    for item in pending:
+    for i, item in enumerate(pending):
         payload = item.get('payload', {})
         video_url = payload.get('video_url')
         
         if video_url:
+            print(f"[PENDING] Processing {i+1}/{len(pending)}: {payload.get('title', 'Unknown')}")
             result = process_single_video(
                 video_url=video_url,
                 user_id=item['user_id'],
@@ -529,38 +580,43 @@ async def process_pending(limit: int = 5):
             )
             processed.append(result)
     
+    success_count = len([p for p in processed if p.get('success')])
+    print(f"[PENDING] Complete: {success_count}/{len(processed)} successful")
+    
     return {
         "success": True,
         "processed": len(processed),
+        "successful": success_count,
         "results": processed
     }
 
+
 @app.post("/list-videos")
 async def list_videos(request: ListVideosRequest):
-    """List available videos from a profile without downloading"""
+    """List videos from a profile without downloading"""
     try:
         if request.platform == "tiktok":
-            url = f"https://www.tiktok.com/@{request.username}"
+            profile_url = f"https://www.tiktok.com/@{request.username}"
         elif request.platform == "youtube":
-            url = f"https://www.youtube.com/@{request.username}/videos"
+            profile_url = f"https://www.youtube.com/@{request.username}/videos"
         else:
             raise HTTPException(400, f"Unsupported platform: {request.platform}")
         
         ydl_opts = {
-            'extract_flat': 'in_playlist',
+            'extract_flat': True,
             'quiet': True,
             'no_warnings': True,
             'playlist_items': f'1-{request.max_videos}'
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(profile_url, download=False)
             entries = info.get('entries', [])
         
         videos = []
         for entry in entries:
             videos.append({
-                "url": entry.get('url') or entry.get('webpage_url', ''),
+                "url": entry.get('url') or entry.get('webpage_url'),
                 "title": entry.get('title', 'Untitled'),
                 "description": entry.get('description', ''),
                 "thumbnail": entry.get('thumbnail', ''),
@@ -572,7 +628,34 @@ async def list_videos(request: ListVideosRequest):
         return {"success": True, "videos": videos, "total": len(videos)}
         
     except Exception as e:
-        print(f"List videos error: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/process-selected")
+async def process_selected(request: ProcessSelectedRequest):
+    """Process specific selected videos"""
+    try:
+        processed = []
+        for video in request.videos[:10]:  # Limit to 10 at a time
+            result = process_single_video(
+                video_url=video.url,
+                user_id=request.user_id,
+                source_id=request.source_id,
+                metadata_override={
+                    "title": video.title,
+                    "description": video.description,
+                    "thumbnail": video.thumbnail,
+                    "duration": video.duration,
+                    "view_count": video.view_count,
+                    "like_count": video.like_count
+                }
+            )
+            processed.append(result)
+        
+        success_count = len([p for p in processed if p.get('success')])
+        return {"success": True, "processed": len(processed), "successful": success_count}
+        
+    except Exception as e:
         raise HTTPException(500, str(e))
 
 
